@@ -1,0 +1,164 @@
+version: 2.1
+
+executors:
+  std: &std
+    working_directory: /opt/project
+    docker:
+      - image: 660610034966.dkr.ecr.us-east-1.amazonaws.com/mistsys/golang-builder:bullseye-1.17.8-88
+    environment: &common_env
+      PROJECT: global-redirect
+      GOPATH: /go
+      GOBIN: /opt/project/bin
+      GOFLAGS: -mod=readonly -trimpath
+      ARTIFACTS_DIR: /opt/project/artifacts
+      version_file: /opt/project/artifacts/VERSION
+  fips: &fips
+    <<: *std
+    docker:
+      - image: 660610034966.dkr.ecr.us-east-1.amazonaws.com/mistsys/golang-builder:bullseye-1.17.8b7-87
+    environment:
+      <<: *common_env
+      FIPS: 1
+      ARTIFACTS_DIR: /opt/project/artifacts/fips
+      version_file: /opt/project/artifacts/fips/VERSION
+
+orbs:
+  gcp-cli: circleci/gcp-cli@2.4.0
+
+jobs:
+  build:
+    parameters:
+      builder:
+        type: executor
+        default: std
+      golangcilint-flags:
+        type: string
+        default: ""
+      golangcilint-version:
+        type: string
+        default: 1.44.1
+    executor: << parameters.builder >>
+    steps:
+      - checkout
+      - run:
+          name: configure git and working dirs
+          command: |
+            set -e
+            git config --global user.email "circleci@mist.com"
+            git config --global user.name "CircleCI User"
+            git config --global push.default simple
+            git config --global url."git@github.com:".insteadOf "https://github.com/"
+            mkdir -p $GOBIN $ARTIFACTS_DIR
+      - run:
+          name: get mist-ci
+          command: |
+            git clone ssh://git@github.com/mistsys/mist-ci --depth 1 --quiet
+            git -C mist-ci rev-parse HEAD
+            git -C mist-ci fetch --prune --tags
+      - when:
+          condition:
+            equal: [ *std, << parameters.builder >> ]
+          steps:
+            - run:
+                name: install github-release
+                command: |
+                  go install github.com/mistsys/github-release@latest
+      - run:
+          name: Download golangci-lint
+          command: |
+            curl -sL https://github.com/golangci/golangci-lint/releases/download/v<< parameters.golangcilint-version >>/golangci-lint-<< parameters.golangcilint-version >>-linux-amd64.tar.gz | tar xz
+      - run:
+          name: Run golangci-lint checks
+          command: |
+            golangci-lint-<< parameters.golangcilint-version >>-linux-amd64/golangci-lint run << parameters.golangcilint-flags >>
+      - restore_cache:
+          name: restoring go mod cache
+          key: deps-{{ checksum "go.mod" }}-{{ checksum "go.sum" }}
+      - run:
+          name: test
+          command: |
+            make test
+      - run:
+          name: coverage
+          command: |
+            make coverage
+      - store_artifacts:
+          path: /opt/project/cover.html
+          destination: cover.html
+      - store_artifacts:
+          path: /opt/project/cover.txt
+          destination: cover.out
+      - store_artifacts:
+          path: /opt/project/cover.out
+          destination: cover.out
+      - run:
+          name: create version
+          command: |
+            mist-ci/ci_tagging.sh $version_file
+      - run:
+          name: build binaries
+          command: |
+            make
+      - run:
+          name: document build for reproducibility
+          command: |
+            make dep-snapshot | tee $ARTIFACTS_DIR/go.mod.build
+      - store_artifacts:
+          path: /opt/project/artifacts
+          destination: /
+      - save_cache:
+          name: saving go mod cache
+          key: deps-{{ checksum "go.mod" }}-{{ checksum "go.sum" }}
+          paths:
+            - /go/pkg/mod
+      - when:
+          condition:
+            equal: [ *std, << parameters.builder >> ]
+          steps:
+            - persist_to_workspace:
+                root: /opt
+                paths:
+                  - project
+      - unless:
+          condition:
+            equal: [ *std, << parameters.builder >> ]
+          steps:
+            - persist_to_workspace:
+                root: /opt
+                paths:
+                  - project/artifacts/fips
+
+  release:
+    executor: std
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /opt
+      - setup_remote_docker
+      - gcp-cli/install
+      - gcp-cli/initialize
+      - run:
+          name: tagging
+          command: |
+            mist-ci/ci_tagging.sh -t $version_file
+      - run:
+          name: make global-redirect docker container
+          environment:
+            DOCKERFILE: cmd/global-redirect/Dockerfile
+          command: |
+            mist-ci/ci_release.sh -V "$(cat $version_file)" ecr
+            mist-ci/ci_release.sh -V "$(cat $version_file)" gcr
+
+workflows:
+  all:
+    jobs:
+      - build:
+          context: mist-ci
+          matrix:
+            parameters:
+              builder:
+                - std
+      - release:
+          context: mist-ci
+          requires:
+            - build
